@@ -10,6 +10,7 @@ vulkano-shaders = "0.33.0"
 vulkano-win = "0.33.0"
 winit = "0.28.7"
 rand = "0.8.5"
+colored = "2"
 
 [profile.dev]
 opt-level = 1

@@ -1,20 +1,37 @@
 mod shaders;
 
-use crate::shaders::Shaders;
+use std::sync::Arc;
+
+use colored::*;
 use default::default;
 use rand::Rng;
-use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
-use vulkano::command_buffer::*;
+use vulkano::command_buffer::{
+    AutoCommandBufferBuilder,
+    CommandBufferUsage,
+    PrimaryAutoCommandBuffer,
+    RenderPassBeginInfo,
+    SubpassContents,
+};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::device::*;
+use vulkano::device::{
+    Device,
+    DeviceCreateInfo,
+    DeviceExtensions,
+    Queue,
+    QueueCreateInfo,
+    QueueFlags,
+};
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
-use vulkano::image::{ImageLayout, ImageUsage, ImageViewAbstract, SwapchainImage};
+use vulkano::image::{ImageUsage, SwapchainImage};
 use vulkano::instance::debug::{
-    DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger,
+    DebugUtilsMessageSeverity,
+    DebugUtilsMessageType,
+    DebugUtilsMessenger,
     DebugUtilsMessengerCreateInfo,
+    Message,
 };
 use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryUsage, StandardMemoryAllocator};
@@ -24,48 +41,36 @@ use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::GraphicsPipeline;
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
 use vulkano::swapchain::{
-    acquire_next_image, AcquireError, PresentMode, Surface, Swapchain, SwapchainCreateInfo,
-    SwapchainCreationError, SwapchainPresentInfo,
+    acquire_next_image,
+    AcquireError,
+    PresentMode,
+    Surface,
+    Swapchain,
+    SwapchainCreateInfo,
+    SwapchainCreationError,
+    SwapchainPresentInfo,
 };
 use vulkano::sync::future::FenceSignalFuture;
-use vulkano::sync::{self, FlushError, GpuFuture};
-use vulkano::{single_pass_renderpass, VulkanLibrary};
-use vulkano_win::{required_extensions, VkSurfaceBuild};
+use vulkano::sync::{FlushError, GpuFuture};
+use vulkano::{single_pass_renderpass, sync, VulkanLibrary};
+use vulkano_win::{create_surface_from_winit, required_extensions};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
+use crate::shaders::Shaders;
+
 fn main() {
     let instance = get_instance();
 
-    let mut messenger_info = DebugUtilsMessengerCreateInfo::user_callback(Arc::new(|msg| {
-        println!(
-            "[{ty:?} {prefix:?} {severity:?}] {desc:?}",
-            ty = msg.ty,
-            prefix = msg.layer_prefix.unwrap_or(""),
-            severity = msg.severity,
-            desc = msg.description,
-        );
-    }));
-
-    messenger_info.message_severity = DebugUtilsMessageSeverity::ERROR
-        | DebugUtilsMessageSeverity::WARNING
-        | DebugUtilsMessageSeverity::INFO
-        | DebugUtilsMessageSeverity::VERBOSE;
-    messenger_info.message_type = DebugUtilsMessageType::GENERAL
-        | DebugUtilsMessageType::PERFORMANCE
-        | DebugUtilsMessageType::VALIDATION;
-    let _messenger = unsafe { DebugUtilsMessenger::new(instance.clone(), messenger_info) };
+    let _messenger = setup_debug_messenger(instance.clone());
 
     let (physical_device, device, mut queues) = get_device(&instance);
 
     let memory_allocator = StandardMemoryAllocator::new_default(device.clone());
     let command_buffer_allocator = StandardCommandBufferAllocator::new(device.clone(), default());
 
-    let event_loop = EventLoop::new();
-    // TODO: Why is surface created before window?
-    let surface = get_surface(instance.clone(), &event_loop);
-    let window = get_window(&surface);
+    let (window, surface, event_loop) = create_window(instance.clone());
 
     let (mut swapchain, images) = get_swapchain(&physical_device, &device, &surface, &window);
 
@@ -79,12 +84,7 @@ fn main() {
 
     let shaders = Shaders::load(device.clone());
 
-    let mut pipeline = get_pipeline(
-        device.clone(),
-        render_pass.clone(),
-        viewport.clone(),
-        &shaders,
-    );
+    let pipeline = get_pipeline(device.clone(), render_pass.clone(), &shaders);
     let queue = queues.next().expect("There should be exactly one queue");
 
     let mut framebuffers = get_framebuffers(&images, &render_pass);
@@ -123,7 +123,7 @@ fn main() {
                 }) {
                     Ok(r) => r,
                     Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
-                    Err(e) => panic!("Failed to recreate swapchain: {e}"),
+                    Err(_e) => panic!("Failed to recreate swapchain: {_e}"),
                 };
                 swapchain = new_swapchain;
 
@@ -131,24 +131,9 @@ fn main() {
 
                 if window_resized {
                     window_resized = false;
-
                     viewport.dimensions = new_dimensions.into();
-                    pipeline = get_pipeline(
-                        device.clone(),
-                        render_pass.clone(),
-                        viewport.clone(),
-                        &shaders,
-                    );
                 }
             }
-
-            let command_buffers = get_command_buffers(
-                &command_buffer_allocator,
-                &queue,
-                &pipeline,
-                &framebuffers,
-                &memory_allocator,
-            );
 
             let (image_i, suboptimal, acquire_future) =
                 match acquire_next_image(swapchain.clone(), None) {
@@ -157,12 +142,21 @@ fn main() {
                         recreate_swapchain = true;
                         return;
                     }
-                    Err(e) => panic!("Failed to acquire next image: {e}"),
+                    Err(_e) => panic!("Failed to acquire next image: {_e}"),
                 };
 
             if suboptimal {
                 recreate_swapchain = true;
             }
+
+            let command_buffers = get_command_buffers(
+                &command_buffer_allocator,
+                &queue,
+                &pipeline,
+                &framebuffers,
+                &memory_allocator,
+                viewport.clone(),
+            );
 
             // wait for the fence related to this image to finish (normally this would be the oldest fence)
             if let Some(image_fence) = &fences[image_i as usize] {
@@ -209,6 +203,44 @@ fn main() {
     });
 }
 
+fn setup_debug_messenger(instance: Arc<Instance>) -> DebugUtilsMessenger {
+    let cb = Arc::new(|msg: &Message| {
+        println!(
+            "[{severity} {ty}][{prefix:.14}] {desc}",
+            severity = match msg.severity {
+                DebugUtilsMessageSeverity::ERROR => "ERR".red(),
+                DebugUtilsMessageSeverity::WARNING => "WRN".yellow(),
+                DebugUtilsMessageSeverity::INFO => "INF".blue(),
+                DebugUtilsMessageSeverity::VERBOSE => "VRB".white(),
+                _ => unimplemented!("Add type"),
+            },
+            ty = match msg.ty {
+                DebugUtilsMessageType::GENERAL => "GNRL",
+                DebugUtilsMessageType::VALIDATION => "VLDN",
+                DebugUtilsMessageType::PERFORMANCE => "PERF",
+                _ => unimplemented!("Add type"),
+            }
+            .white(),
+            prefix = msg.layer_prefix.unwrap_or("").white(),
+            desc = msg.description,
+        );
+    });
+
+    let mut messenger_info = DebugUtilsMessengerCreateInfo::user_callback(cb);
+
+    messenger_info.message_severity = DebugUtilsMessageSeverity::ERROR
+        | DebugUtilsMessageSeverity::WARNING
+        | DebugUtilsMessageSeverity::INFO
+        | DebugUtilsMessageSeverity::VERBOSE;
+
+    messenger_info.message_type = DebugUtilsMessageType::GENERAL
+        | DebugUtilsMessageType::PERFORMANCE
+        | DebugUtilsMessageType::VALIDATION;
+
+    unsafe { DebugUtilsMessenger::new(instance, messenger_info) }
+        .expect("Debug messenger should be created")
+}
+
 fn get_device(
     instance: &Arc<Instance>,
 ) -> (
@@ -228,7 +260,7 @@ fn get_device(
         .filter(|p| {
             p.supported_extensions().contains(&device_extensions)
                 && p.properties().device_type == PhysicalDeviceType::DiscreteGpu
-            // TODO: Pick min by type
+            // TODO: Pick best by type
         })
         .next()
         .expect("No discrete devices available");
@@ -285,11 +317,11 @@ fn get_swapchain(
             //         .unwrap()[0]
             //         .0,
             // ),
-            image_format: Some(Format::B8G8R8A8_SRGB),
+            image_format: Some(Format::B8G8R8A8_SRGB), // TODO: Pick best format
             image_extent: dimensions.into(),
             image_usage: ImageUsage::COLOR_ATTACHMENT,
             composite_alpha,
-            present_mode: PresentMode::Mailbox,
+            present_mode: PresentMode::Mailbox, // TODO: Mailbox might not be supported
             ..default()
         },
     )
@@ -302,6 +334,7 @@ fn get_command_buffers(
     pipeline: &Arc<GraphicsPipeline>,
     framebuffers: &Vec<Arc<Framebuffer>>,
     memory_allocator: &StandardMemoryAllocator,
+    viewport: Viewport,
 ) -> Vec<Arc<PrimaryAutoCommandBuffer>> {
     let mut rng = rand::thread_rng();
 
@@ -339,7 +372,7 @@ fn get_command_buffers(
             let mut builder = AutoCommandBufferBuilder::primary(
                 command_buffer_allocator,
                 queue.queue_family_index(),
-                CommandBufferUsage::MultipleSubmit,
+                CommandBufferUsage::OneTimeSubmit,
             )
             .unwrap();
 
@@ -352,6 +385,7 @@ fn get_command_buffers(
                     SubpassContents::Inline,
                 )
                 .unwrap()
+                .set_viewport(0, vec![viewport.clone()])
                 .bind_pipeline_graphics(pipeline.clone())
                 .bind_vertex_buffers(0, vertex_buffer.clone())
                 .draw(vertex_buffer.len() as u32, 1, 0, 0)
@@ -367,14 +401,13 @@ fn get_command_buffers(
 fn get_pipeline(
     device: Arc<Device>,
     render_pass: Arc<RenderPass>,
-    viewport: Viewport,
     shaders: &Shaders,
 ) -> Arc<GraphicsPipeline> {
     GraphicsPipeline::start()
         .vertex_input_state(Vertex::per_vertex())
         .vertex_shader(shaders.vertex_shader.entry_point("main").unwrap(), ())
         .input_assembly_state(InputAssemblyState::new())
-        .viewport_state(ViewportState::viewport_fixed_scissor_irrelevant([viewport]))
+        .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
         .fragment_shader(shaders.fragment_shader.entry_point("main").unwrap(), ())
         .render_pass(Subpass::from(render_pass, 0).unwrap())
         .build(device)
@@ -420,12 +453,6 @@ fn get_render_pass(device: Arc<Device>, swapchain: &Arc<Swapchain>) -> Arc<Rende
     .unwrap()
 }
 
-fn get_surface(instance: Arc<Instance>, event_loop: &EventLoop<()>) -> Arc<Surface> {
-    WindowBuilder::new()
-        .build_vk_surface(&event_loop, instance)
-        .unwrap()
-}
-
 #[derive(BufferContents, VertexTrait)]
 #[repr(C)]
 struct Vertex {
@@ -435,13 +462,19 @@ struct Vertex {
     color: [f32; 3],
 }
 
-fn get_window(surface: &Arc<Surface>) -> Arc<Window> {
-    surface
-        .object()
-        .unwrap()
-        .clone()
-        .downcast::<Window>()
-        .unwrap()
+fn create_window(instance: Arc<Instance>) -> (Arc<Window>, Arc<Surface>, EventLoop<()>) {
+    let event_loop = EventLoop::new();
+
+    let window = Arc::new(
+        WindowBuilder::new()
+            .build(&event_loop)
+            .expect("Window should be created"),
+    );
+
+    let surface =
+        create_surface_from_winit(window.clone(), instance).expect("Surface should be created");
+
+    (window, surface, event_loop)
 }
 
 fn get_instance() -> Arc<Instance> {
