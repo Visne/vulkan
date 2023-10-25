@@ -2,7 +2,8 @@ mod shaders;
 
 use std::sync::Arc;
 
-use colored::*;
+#[cfg(debug_assertions)]
+use colored::Colorize;
 use default::default;
 use rand::Rng;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
@@ -26,6 +27,7 @@ use vulkano::device::{
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::image::{ImageUsage, SwapchainImage};
+#[cfg(debug_assertions)]
 use vulkano::instance::debug::{
     DebugUtilsMessageSeverity,
     DebugUtilsMessageType,
@@ -33,7 +35,9 @@ use vulkano::instance::debug::{
     DebugUtilsMessengerCreateInfo,
     Message,
 };
-use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
+#[cfg(debug_assertions)]
+use vulkano::instance::InstanceExtensions;
+use vulkano::instance::{Instance, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryUsage, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
@@ -50,7 +54,6 @@ use vulkano::swapchain::{
     SwapchainCreationError,
     SwapchainPresentInfo,
 };
-use vulkano::sync::future::FenceSignalFuture;
 use vulkano::sync::{FlushError, GpuFuture};
 use vulkano::{single_pass_renderpass, sync, VulkanLibrary};
 use vulkano_win::{create_surface_from_winit, required_extensions};
@@ -62,17 +65,20 @@ use crate::shaders::Shaders;
 
 fn main() {
     let instance = get_instance();
+
+    #[cfg(debug_assertions)]
     let _messenger = setup_debug_messenger(instance.clone());
+
     let (physical_device, device, mut queues) = get_device(&instance);
-
-    let memory_allocator = StandardMemoryAllocator::new_default(device.clone());
-    let command_buffer_allocator = StandardCommandBufferAllocator::new(device.clone(), default());
-
-    let (window, surface, event_loop, mut viewport) = create_window(instance.clone());
-    let (mut swapchain, mut images) = get_swapchain(&physical_device, &device, &surface, &window);
-    let render_pass = get_render_pass(device.clone(), &swapchain);
-
     let shaders = Shaders::load(device.clone());
+    let (window, surface, event_loop, mut viewport) = create_window(instance.clone());
+
+    //let format = physical_device.surface_formats(&surface, default()).unwrap()[0].0;
+    let format = Format::B8G8R8A8_SRGB; // TODO: Pick best format
+
+    let (mut swapchain, images) =
+        get_swapchain(&physical_device, &device, &surface, &window, format);
+    let render_pass = get_render_pass(device.clone(), &swapchain);
 
     let pipeline = get_pipeline(device.clone(), render_pass.clone(), &shaders);
     let queue = queues.next().expect("There should be exactly one queue");
@@ -80,10 +86,9 @@ fn main() {
     let mut framebuffers = get_framebuffers(&images, &render_pass);
 
     let mut bad_swapchain = false;
-
-    let frames_in_flight = images.len();
-    let mut fences: Vec<Option<Arc<FenceSignalFuture<_>>>> = vec![None; frames_in_flight];
-    let mut previous_fence_i = 0;
+    let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
+    let memory_allocator = StandardMemoryAllocator::new_default(device.clone());
+    let command_buffer_allocator = StandardCommandBufferAllocator::new(device.clone(), default());
 
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
@@ -96,18 +101,28 @@ fn main() {
         }
 
         Event::MainEventsCleared => {
+            previous_frame_end.as_mut().unwrap().cleanup_finished();
+
             if bad_swapchain {
                 bad_swapchain = false;
 
-                (swapchain, images) =
-                    match recreate_swapchain(swapchain.clone(), window.inner_size().into()) {
-                        Ok(r) => r,
-                        Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
-                        Err(_e) => panic!("Failed to recreate swapchain: {_e}"),
-                    };
-                framebuffers = get_framebuffers(&images, &render_pass);
+                let dimensions = window.inner_size().into();
+                #[allow(unused_variables)] // TODO: Remove after RustRover bug is fixed
+                let (new_swapchain, new_images) = match swapchain.recreate(SwapchainCreateInfo {
+                    image_extent: dimensions,
+                    ..swapchain.create_info()
+                }) {
+                    Ok(r) => r,
+                    Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
+                    Err(e) => panic!("Failed to recreate swapchain: {e}"),
+                };
+
+                swapchain = new_swapchain;
+
+                framebuffers = get_framebuffers(&new_images, &render_pass);
             }
 
+            #[allow(unused_variables)] // TODO: Remove after RustRover bug is fixed
             let (image_index, suboptimal, acquire_future) =
                 match acquire_next_image(swapchain.clone(), None) {
                     Ok(r) => r,
@@ -116,7 +131,7 @@ fn main() {
                         bad_swapchain = true;
                         return;
                     }
-                    Err(_e) => panic!("Failed to acquire next image: {_e}"),
+                    Err(e) => panic!("Failed to acquire next image: {e}"),
                 };
 
             if suboptimal {
@@ -124,35 +139,20 @@ fn main() {
                 bad_swapchain = true;
             }
 
-            let command_buffers = get_command_buffers(
+            let command_buffer = get_command_buffer(
                 &command_buffer_allocator,
                 &queue,
                 &pipeline,
-                &framebuffers,
+                &framebuffers[image_index as usize],
                 &memory_allocator,
-                viewport.clone(),
+                &viewport,
             );
 
-            // wait for the fence related to this image to finish (normally this would be the oldest fence)
-            if let Some(image_fence) = &fences[image_index as usize] {
-                image_fence.wait(None).unwrap();
-            }
-
-            let previous_future = match fences[previous_fence_i as usize].clone() {
-                // Create a NowFuture
-                None => {
-                    let mut now = sync::now(device.clone());
-                    now.cleanup_finished();
-
-                    now.boxed()
-                }
-                // Use the existing FenceSignalFuture
-                Some(fence) => fence.boxed(),
-            };
-
-            let future = previous_future
+            let future = previous_frame_end
+                .take()
+                .unwrap()
                 .join(acquire_future)
-                .then_execute(queue.clone(), command_buffers[image_index as usize].clone())
+                .then_execute(queue.clone(), command_buffer.clone())
                 .unwrap()
                 .then_swapchain_present(
                     queue.clone(),
@@ -160,32 +160,23 @@ fn main() {
                 )
                 .then_signal_fence_and_flush();
 
-            fences[image_index as usize] = match future {
-                Ok(value) => Some(Arc::new(value)),
+            match future {
+                Ok(future) => previous_frame_end = Some(future.boxed()),
                 Err(FlushError::OutOfDate) => {
                     bad_swapchain = true;
-                    None
+                    previous_frame_end = Some(sync::now(device.clone()).boxed());
                 }
                 Err(e) => {
                     println!("Failed to flush future: {e}");
-                    None
                 }
             };
-
-            previous_fence_i = image_index;
         }
 
         _ => {}
     });
 }
 
-fn recreate_swapchain(
-    swapchain: Arc<Swapchain>,
-    dimensions: [u32; 2],
-) -> Result<(Arc<Swapchain>, Vec<Arc<SwapchainImage>>), SwapchainCreationError> {
-    swapchain.recreate(SwapchainCreateInfo { image_extent: dimensions, ..swapchain.create_info() })
-}
-
+#[cfg(debug_assertions)]
 fn setup_debug_messenger(instance: Arc<Instance>) -> DebugUtilsMessenger {
     let cb = Arc::new(|msg: &Message| {
         println!(
@@ -236,35 +227,33 @@ fn get_device(
     let physical_device = instance
         .enumerate_physical_devices()
         .expect("Could not enumerate physical devices")
-        .filter(|p| {
+        .find(|p| {
             p.supported_extensions().contains(&device_extensions)
                 && p.properties().device_type == PhysicalDeviceType::DiscreteGpu
             // TODO: Pick best by type
         })
-        .next()
         .expect("No discrete devices available");
 
-    let queue_family_index = physical_device
+    let queue_family_index: u32 = physical_device
         .queue_family_properties()
         .iter()
         .enumerate()
-        .position(|(_index, queue_family_properties)| {
-            queue_family_properties.queue_flags.contains(QueueFlags::GRAPHICS)
-        })
-        .expect("Couldn't find a graphical queue family with specified queue flags")
-        as u32;
+        .position(|(_, properties)| properties.queue_flags.contains(QueueFlags::GRAPHICS))
+        .expect("Should find a graphical queue family with the specified queue flags")
+        .try_into()
+        .expect("Should fit into u32");
 
     let (device, queues) = Device::new(
         physical_device.clone(),
         DeviceCreateInfo {
-            queue_create_infos: vec![QueueCreateInfo { queue_family_index, ..default() }],
             enabled_extensions: device_extensions,
+            queue_create_infos: vec![QueueCreateInfo { queue_family_index, ..default() }],
             ..default()
         },
     )
-    .expect("Failed to create device");
+    .expect("Should successfully create device");
 
-    return (physical_device, device, queues);
+    (physical_device, device, queues)
 }
 
 fn get_swapchain(
@@ -272,11 +261,11 @@ fn get_swapchain(
     device: &Arc<Device>,
     surface: &Arc<Surface>,
     window: &Arc<Window>,
+    format: Format,
 ) -> (Arc<Swapchain>, Vec<Arc<SwapchainImage>>) {
     let caps = physical_device
-        .surface_capabilities(&surface, default())
-        .expect("Failed to get surface capabilities");
-    let dimensions = window.inner_size();
+        .surface_capabilities(surface, default())
+        .expect("Should get surface capabilities");
     let composite_alpha = caps.supported_composite_alpha.into_iter().next().unwrap();
 
     assert!(device.enabled_extensions().khr_swapchain);
@@ -285,31 +274,25 @@ fn get_swapchain(
         surface.clone(),
         SwapchainCreateInfo {
             min_image_count: caps.min_image_count + 1,
-            // image_format: Some(
-            //     physical_device
-            //         .surface_formats(&surface, default())
-            //         .unwrap()[0]
-            //         .0,
-            // ),
-            image_format: Some(Format::B8G8R8A8_SRGB), // TODO: Pick best format
-            image_extent: dimensions.into(),
+            image_format: Some(format),
+            image_extent: window.inner_size().into(),
             image_usage: ImageUsage::COLOR_ATTACHMENT,
             composite_alpha,
             present_mode: PresentMode::Mailbox, // TODO: Mailbox might not be supported
             ..default()
         },
     )
-    .expect("Failed to create swapchain")
+    .expect("Should successfully create swapchain")
 }
 
-fn get_command_buffers(
+fn get_command_buffer(
     command_buffer_allocator: &StandardCommandBufferAllocator,
     queue: &Arc<Queue>,
     pipeline: &Arc<GraphicsPipeline>,
-    framebuffers: &Vec<Arc<Framebuffer>>,
+    framebuffer: &Arc<Framebuffer>,
     memory_allocator: &StandardMemoryAllocator,
-    viewport: Viewport,
-) -> Vec<Arc<PrimaryAutoCommandBuffer>> {
+    viewport: &Viewport,
+) -> Arc<PrimaryAutoCommandBuffer> {
     let mut rng = rand::thread_rng();
 
     #[rustfmt::skip]
@@ -334,36 +317,39 @@ fn get_command_buffers(
     )
     .unwrap();
 
-    framebuffers
-        .iter()
-        .map(|framebuffer| {
-            let mut builder = AutoCommandBufferBuilder::primary(
-                command_buffer_allocator,
-                queue.queue_family_index(),
-                CommandBufferUsage::OneTimeSubmit,
-            )
-            .unwrap();
+    let mut builder = AutoCommandBufferBuilder::primary(
+        command_buffer_allocator,
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .unwrap();
 
-            builder
-                .begin_render_pass(
-                    RenderPassBeginInfo {
-                        clear_values: vec![Some([0.01, 0.01, 0.01, 1.0].into())],
-                        ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
-                    },
-                    SubpassContents::Inline,
-                )
-                .unwrap()
-                .set_viewport(0, vec![viewport.clone()])
-                .bind_pipeline_graphics(pipeline.clone())
-                .bind_vertex_buffers(0, vertex_buffer.clone())
-                .draw(vertex_buffer.len() as u32, 1, 0, 0)
-                .unwrap()
-                .end_render_pass()
-                .unwrap();
+    builder
+        .begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some([0.01, 0.01, 0.01, 1.0].into())],
+                ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
+            },
+            SubpassContents::Inline,
+        )
+        .unwrap()
+        .set_viewport(0, vec![viewport.clone()])
+        .bind_pipeline_graphics(pipeline.clone())
+        .bind_vertex_buffers(0, vertex_buffer.clone())
+        .draw(
+            vertex_buffer
+                .len()
+                .try_into()
+                .expect("Vertex buffer length should not exceed u32::MAX"),
+            1,
+            0,
+            0,
+        )
+        .unwrap()
+        .end_render_pass()
+        .unwrap();
 
-            Arc::new(builder.build().unwrap())
-        })
-        .collect()
+    Arc::new(builder.build().unwrap())
 }
 
 fn get_pipeline(
@@ -372,10 +358,10 @@ fn get_pipeline(
     shaders: &Shaders,
 ) -> Arc<GraphicsPipeline> {
     GraphicsPipeline::start()
+        .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
+        .input_assembly_state(InputAssemblyState::new())
         .vertex_input_state(Vertex::per_vertex())
         .vertex_shader(shaders.vertex_shader.entry_point("main").unwrap(), ())
-        .input_assembly_state(InputAssemblyState::new())
-        .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
         .fragment_shader(shaders.fragment_shader.entry_point("main").unwrap(), ())
         .render_pass(Subpass::from(render_pass, 0).unwrap())
         .build(device)
@@ -430,11 +416,12 @@ struct Vertex {
 fn create_window(instance: Arc<Instance>) -> (Arc<Window>, Arc<Surface>, EventLoop<()>, Viewport) {
     let event_loop = EventLoop::new();
 
-    let window =
-        Arc::new(WindowBuilder::new().build(&event_loop).expect("Window should be created"));
+    let window = Arc::new(
+        WindowBuilder::new().build(&event_loop).expect("Should successfully create Window"),
+    );
 
-    let surface =
-        create_surface_from_winit(window.clone(), instance).expect("Surface should be created");
+    let surface = create_surface_from_winit(window.clone(), instance)
+        .expect("Should successfully create Surface");
 
     let viewport = Viewport {
         origin: [0.0, 0.0],
@@ -446,13 +433,14 @@ fn create_window(instance: Arc<Instance>) -> (Arc<Window>, Arc<Surface>, EventLo
 }
 
 fn get_instance() -> Arc<Instance> {
-    let library = VulkanLibrary::new().expect("No local Vulkan library/DLL");
+    let library = VulkanLibrary::new().expect("Should find local Vulkan library/DLL");
 
-    let enabled_extensions = InstanceExtensions {
-        ext_debug_report: true,
-        ext_debug_utils: true,
-        ..required_extensions(&library)
-    };
+    #[cfg(debug_assertions)]
+    let enabled_extensions =
+        InstanceExtensions { ext_debug_utils: true, ..required_extensions(&library) };
+
+    #[cfg(not(debug_assertions))]
+    let enabled_extensions = required_extensions(&library);
 
     Instance::new(library, InstanceCreateInfo { enabled_extensions, ..default() })
         .expect("Failed to create instance")
