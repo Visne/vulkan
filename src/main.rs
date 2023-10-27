@@ -1,20 +1,28 @@
 mod shaders;
 
+use std::default::Default;
 use std::sync::Arc;
+use std::time::Instant;
 
+use cgmath::{Angle, Matrix4, Rad};
 #[cfg(debug_assertions)]
 use colored::Colorize;
 use default::default;
 use rand::Rng;
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
+use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder,
     CommandBufferUsage,
     PrimaryAutoCommandBuffer,
     RenderPassBeginInfo,
+    SubpassBeginInfo,
     SubpassContents,
+    SubpassEndInfo,
 };
+use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
+use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device,
@@ -26,52 +34,60 @@ use vulkano::device::{
 };
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
-use vulkano::image::{ImageUsage, SwapchainImage};
+use vulkano::image::{Image, ImageUsage};
 #[cfg(debug_assertions)]
 use vulkano::instance::debug::{
     DebugUtilsMessageSeverity,
     DebugUtilsMessageType,
-    DebugUtilsMessenger,
+    DebugUtilsMessengerCallback,
+    DebugUtilsMessengerCallbackData,
     DebugUtilsMessengerCreateInfo,
-    Message,
 };
-#[cfg(debug_assertions)]
-use vulkano::instance::InstanceExtensions;
-use vulkano::instance::{Instance, InstanceCreateInfo};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryUsage, StandardMemoryAllocator};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
+use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
+use vulkano::memory::allocator::{
+    AllocationCreateInfo,
+    MemoryAllocator,
+    MemoryTypeFilter,
+    StandardMemoryAllocator,
+};
+use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
+use vulkano::pipeline::graphics::vertex_input::{Vertex as VertexTrait, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::GraphicsPipeline;
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
+use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+use vulkano::pipeline::{
+    DynamicState,
+    GraphicsPipeline,
+    Pipeline,
+    PipelineBindPoint,
+    PipelineLayout,
+    PipelineShaderStageCreateInfo,
+};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
+use vulkano::shader::EntryPoint;
 use vulkano::swapchain::{
     acquire_next_image,
-    AcquireError,
     PresentMode,
     Surface,
     Swapchain,
     SwapchainCreateInfo,
-    SwapchainCreationError,
     SwapchainPresentInfo,
 };
-use vulkano::sync::{FlushError, GpuFuture};
-use vulkano::{single_pass_renderpass, sync, VulkanLibrary};
-use vulkano_win::{create_surface_from_winit, required_extensions};
+use vulkano::sync::GpuFuture;
+use vulkano::{single_pass_renderpass, sync, Validated, VulkanError, VulkanLibrary};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
-use crate::shaders::Shaders;
+use crate::shaders::{fragment_shader, vertex_shader};
 
+#[allow(clippy::too_many_lines)]
 fn main() {
-    let instance = get_instance();
-
-    #[cfg(debug_assertions)]
-    let _messenger = setup_debug_messenger(instance.clone());
+    let event_loop = EventLoop::new();
+    let instance = get_instance(&event_loop);
 
     let (physical_device, device, mut queues) = get_device(&instance);
-    let shaders = Shaders::load(device.clone());
-    let (window, surface, event_loop, mut viewport) = create_window(instance.clone());
+    let (window, surface, mut viewport) = create_window(instance.clone(), &event_loop);
 
     //let format = physical_device.surface_formats(&surface, default()).unwrap()[0].0;
     let format = Format::B8G8R8A8_SRGB; // TODO: Pick best format
@@ -80,15 +96,31 @@ fn main() {
         get_swapchain(&physical_device, &device, &surface, &window, format);
     let render_pass = get_render_pass(device.clone(), &swapchain);
 
-    let pipeline = get_pipeline(device.clone(), render_pass.clone(), &shaders);
+    let vs = vertex_shader::load(device.clone()).unwrap().entry_point("main").unwrap();
+    let fs = fragment_shader::load(device.clone()).unwrap().entry_point("main").unwrap();
+
+    let pipeline = get_pipeline(device.clone(), render_pass.clone(), viewport.clone(), vs, fs);
     let queue = queues.next().expect("There should be exactly one queue");
 
     let mut framebuffers = get_framebuffers(&images, &render_pass);
 
     let mut bad_swapchain = false;
     let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
-    let memory_allocator = StandardMemoryAllocator::new_default(device.clone());
+    let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
     let command_buffer_allocator = StandardCommandBufferAllocator::new(device.clone(), default());
+    let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone(), default());
+
+    let uniform_buffer = SubbufferAllocator::new(
+        memory_allocator.clone(),
+        SubbufferAllocatorCreateInfo {
+            buffer_usage: BufferUsage::UNIFORM_BUFFER,
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..default()
+        },
+    );
+
+    let rotation_start = Instant::now();
 
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
@@ -97,7 +129,7 @@ fn main() {
 
         Event::WindowEvent { event: WindowEvent::Resized(_), .. } => {
             bad_swapchain = true;
-            viewport.dimensions = window.inner_size().into();
+            viewport.extent = window.inner_size().into();
         }
 
         Event::MainEventsCleared => {
@@ -107,15 +139,12 @@ fn main() {
                 bad_swapchain = false;
 
                 let dimensions = window.inner_size().into();
-                #[allow(unused_variables)] // TODO: Remove after RustRover bug is fixed
-                let (new_swapchain, new_images) = match swapchain.recreate(SwapchainCreateInfo {
-                    image_extent: dimensions,
-                    ..swapchain.create_info()
-                }) {
-                    Ok(r) => r,
-                    Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
-                    Err(e) => panic!("Failed to recreate swapchain: {e}"),
-                };
+                let (new_swapchain, new_images) = swapchain
+                    .recreate(SwapchainCreateInfo {
+                        image_extent: dimensions,
+                        ..swapchain.create_info()
+                    })
+                    .expect("Failed to recreate swapchain: {e}");
 
                 swapchain = new_swapchain;
 
@@ -124,9 +153,9 @@ fn main() {
 
             #[allow(unused_variables)] // TODO: Remove after RustRover bug is fixed
             let (image_index, suboptimal, acquire_future) =
-                match acquire_next_image(swapchain.clone(), None) {
+                match acquire_next_image(swapchain.clone(), None).map_err(Validated::unwrap) {
                     Ok(r) => r,
-                    Err(AcquireError::OutOfDate) => {
+                    Err(VulkanError::OutOfDate) => {
                         // Recreate swapchain right away
                         bad_swapchain = true;
                         return;
@@ -139,13 +168,73 @@ fn main() {
                 bad_swapchain = true;
             }
 
+            let uniform_buffer_subbuffer = {
+                let elapsed = rotation_start.elapsed();
+                let rotation =
+                    elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0;
+                let theta = Rad(rotation as f32);
+
+                let (s, c) = Rad::sin_cos(theta.into());
+                #[rustfmt::skip]
+                let model = Matrix4::new(
+                    c,  0., -s, 0.,
+                    0., 1., 0., 0.,
+                    s,  0., c,  0.,
+                    0., 0., -1.5, 1.,
+                );
+
+                // note: this teapot was meant for OpenGL where the origin is at the lower left
+                //       instead the origin is at the upper left in Vulkan, so we reverse the Y axis
+
+                let aspect_ratio =
+                    swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
+
+                let vertical_fov = Rad(std::f32::consts::FRAC_PI_2);
+                let near = 0.01;
+                let far = 100.0;
+
+                let f = Rad::cot(vertical_fov / 2.);
+                let fa = f / aspect_ratio;
+                let f1 = (far + near) / (near - far);
+                let f2 = (2. * far * near) / (near - far);
+
+                #[rustfmt::skip]
+                let projection: Matrix4<f32> = Matrix4::new(
+                    fa, 0., 0.,  0.,
+                    0., f,  0.,  0.,
+                    0., 0., f1, -1.,
+                    0., 0., f2,  0.,
+                );
+
+                // let view = Matrix4::look_at_rh(
+                //     Point3::new(0.3, 0.3, 1.0),
+                //     Point3::new(0.0, 0.0, 0.0),
+                //     Vector3::new(0.0, -1.0, 0.0),
+                // );
+                // let scale = Matrix4::from_scale(0.01);
+
+                let uniform_data = vertex_shader::Data {
+                    //world: Matrix4::from(rotation).into(),
+                    //view: (view * scale).into(),
+                    model: model.into(),
+                    projection: projection.into(),
+                };
+
+                let subbuffer = uniform_buffer.allocate_sized().unwrap();
+                *subbuffer.write().unwrap() = uniform_data;
+
+                subbuffer
+            };
+
             let command_buffer = get_command_buffer(
                 &command_buffer_allocator,
                 &queue,
                 &pipeline,
                 &framebuffers[image_index as usize],
-                &memory_allocator,
+                memory_allocator.clone(),
                 &viewport,
+                uniform_buffer_subbuffer,
+                &descriptor_set_allocator,
             );
 
             let future = previous_frame_end
@@ -160,9 +249,9 @@ fn main() {
                 )
                 .then_signal_fence_and_flush();
 
-            match future {
+            match future.map_err(Validated::unwrap) {
                 Ok(future) => previous_frame_end = Some(future.boxed()),
-                Err(FlushError::OutOfDate) => {
+                Err(VulkanError::OutOfDate) => {
                     bad_swapchain = true;
                     previous_frame_end = Some(sync::now(device.clone()).boxed());
                 }
@@ -177,42 +266,47 @@ fn main() {
 }
 
 #[cfg(debug_assertions)]
-fn setup_debug_messenger(instance: Arc<Instance>) -> DebugUtilsMessenger {
-    let cb = Arc::new(|msg: &Message| {
+fn get_debug_messenger_info() -> Vec<DebugUtilsMessengerCreateInfo> {
+    let user_callback = |sev, ty, data: DebugUtilsMessengerCallbackData| {
         println!(
             "[{severity} {ty}][{prefix:.14}] {desc}",
-            severity = match msg.severity {
+            severity = match sev {
                 DebugUtilsMessageSeverity::ERROR => "ERR".red(),
                 DebugUtilsMessageSeverity::WARNING => "WRN".yellow(),
                 DebugUtilsMessageSeverity::INFO => "INF".blue(),
                 DebugUtilsMessageSeverity::VERBOSE => "VRB".white(),
                 _ => unimplemented!("Add type"),
             },
-            ty = match msg.ty {
+            ty = match ty {
                 DebugUtilsMessageType::GENERAL => "GNRL",
                 DebugUtilsMessageType::VALIDATION => "VLDN",
                 DebugUtilsMessageType::PERFORMANCE => "PERF",
                 _ => unimplemented!("Add type"),
             }
             .white(),
-            prefix = msg.layer_prefix.unwrap_or("").white(),
-            desc = msg.description,
+            prefix = data.message_id_name.unwrap_or(""),
+            desc = data.message,
         );
-    });
+    };
 
-    let mut messenger_info = DebugUtilsMessengerCreateInfo::user_callback(cb);
-
-    messenger_info.message_severity = DebugUtilsMessageSeverity::ERROR
+    let message_severity = DebugUtilsMessageSeverity::ERROR
         | DebugUtilsMessageSeverity::WARNING
         | DebugUtilsMessageSeverity::INFO
         | DebugUtilsMessageSeverity::VERBOSE;
 
-    messenger_info.message_type = DebugUtilsMessageType::GENERAL
+    let message_type = DebugUtilsMessageType::GENERAL
         | DebugUtilsMessageType::PERFORMANCE
         | DebugUtilsMessageType::VALIDATION;
 
-    unsafe { DebugUtilsMessenger::new(instance, messenger_info) }
-        .expect("Debug messenger should be created")
+    unsafe {
+        vec![DebugUtilsMessengerCreateInfo {
+            message_severity,
+            message_type,
+            ..DebugUtilsMessengerCreateInfo::user_callback(DebugUtilsMessengerCallback::new(
+                user_callback,
+            ))
+        }]
+    }
 }
 
 fn get_device(
@@ -234,7 +328,7 @@ fn get_device(
         })
         .expect("No discrete devices available");
 
-    let queue_family_index: u32 = physical_device
+    let queue_family_index = physical_device
         .queue_family_properties()
         .iter()
         .enumerate()
@@ -262,7 +356,7 @@ fn get_swapchain(
     surface: &Arc<Surface>,
     window: &Arc<Window>,
     format: Format,
-) -> (Arc<Swapchain>, Vec<Arc<SwapchainImage>>) {
+) -> (Arc<Swapchain>, Vec<Arc<Image>>) {
     let caps = physical_device
         .surface_capabilities(surface, default())
         .expect("Should get surface capabilities");
@@ -274,7 +368,7 @@ fn get_swapchain(
         surface.clone(),
         SwapchainCreateInfo {
             min_image_count: caps.min_image_count + 1,
-            image_format: Some(format),
+            image_format: format,
             image_extent: window.inner_size().into(),
             image_usage: ImageUsage::COLOR_ATTACHMENT,
             composite_alpha,
@@ -290,30 +384,58 @@ fn get_command_buffer(
     queue: &Arc<Queue>,
     pipeline: &Arc<GraphicsPipeline>,
     framebuffer: &Arc<Framebuffer>,
-    memory_allocator: &StandardMemoryAllocator,
+    memory_allocator: Arc<dyn MemoryAllocator>,
     viewport: &Viewport,
+    uniform_buffer_subbuffer: Subbuffer<vertex_shader::Data>,
+    descriptor_set_allocator: &StandardDescriptorSetAllocator,
 ) -> Arc<PrimaryAutoCommandBuffer> {
     let mut rng = rand::thread_rng();
 
-    #[rustfmt::skip]
-    let vertices = vec![
-        Vertex { position: [-0.5,  rng.gen::<f32>() * 2. - 1.], color: [ 1., 0., 0. ] },
-        Vertex { position: [ 0.0, rng.gen::<f32>() * 2. - 1.], color: [ 0., 1., 0. ] },
-        Vertex { position: [ 0.5,  rng.gen::<f32>() * 2. - 1.], color: [ 0., 0., 1. ] },
-    ];
-
-    // #[rustfmt::skip]
-    //     let vertices = vec![
-    //     Vertex { position: [-0.5,  0.5 ], color: [ 1., 0., 0. ] },
-    //     Vertex { position: [ 0.0, -0.5 ], color: [ 0., 1., 0. ] },
-    //     Vertex { position: [ 0.5,  0.5 ], color: [ 0., 0., 1. ] },
+    // let vertices = vec![
+    //     Vertex { position: [-0.5, rng.gen::<f32>() * 2. - 1.], color: [1., 0., 0.] },
+    //     Vertex { position: [0.0, rng.gen::<f32>() * 2. - 1.], color: [0., 1., 0.] },
+    //     Vertex { position: [0.5, rng.gen::<f32>() * 2. - 1.], color: [0., 0., 1.] },
     // ];
 
+    let vertices = vec![
+        Vertex { position: [-0.5, 0.5, 0.], color: [1., 0., 0.] },
+        Vertex { position: [0.0, -0.5, 0.], color: [0., 1., 0.] },
+        Vertex { position: [0.5, 0.5, 0.], color: [0., 0., 1.] },
+        Vertex { position: [1., -0.5, 0.], color: [0., 0., 1.] },
+    ];
+
+    let indices: Vec<u16> = vec![0, 1, 2, 1, 2, 3];
+
     let vertex_buffer = Buffer::from_iter(
-        memory_allocator,
+        memory_allocator.clone(),
         BufferCreateInfo { usage: BufferUsage::VERTEX_BUFFER, ..default() },
-        AllocationCreateInfo { usage: MemoryUsage::Upload, ..default() },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..default()
+        },
         vertices,
+    )
+    .unwrap();
+
+    let index_buffer = Buffer::from_iter(
+        memory_allocator,
+        BufferCreateInfo { usage: BufferUsage::INDEX_BUFFER, ..default() },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..default()
+        },
+        indices,
+    )
+    .unwrap();
+
+    let layout = pipeline.layout().set_layouts().get(0).unwrap();
+    let set = PersistentDescriptorSet::new(
+        descriptor_set_allocator,
+        layout.clone(),
+        [WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer)],
+        [],
     )
     .unwrap();
 
@@ -330,48 +452,85 @@ fn get_command_buffer(
                 clear_values: vec![Some([0.01, 0.01, 0.01, 1.0].into())],
                 ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
             },
-            SubpassContents::Inline,
+            SubpassBeginInfo { contents: SubpassContents::Inline, ..default() },
         )
         .unwrap()
-        .set_viewport(0, vec![viewport.clone()])
+        .set_viewport(0, vec![viewport.clone()].into())
+        .unwrap()
         .bind_pipeline_graphics(pipeline.clone())
+        .unwrap()
+        .bind_descriptor_sets(PipelineBindPoint::Graphics, pipeline.layout().clone(), 0, set)
+        .unwrap()
         .bind_vertex_buffers(0, vertex_buffer.clone())
-        .draw(
-            vertex_buffer
-                .len()
-                .try_into()
-                .expect("Vertex buffer length should not exceed u32::MAX"),
+        .unwrap()
+        .bind_index_buffer(index_buffer.clone())
+        .unwrap()
+        .draw_indexed(
+            index_buffer.len().try_into().expect("Index buffer length should not exceed u32::MAX"),
             1,
             0,
             0,
+            0,
         )
         .unwrap()
-        .end_render_pass()
+        .end_render_pass(SubpassEndInfo::default())
         .unwrap();
 
-    Arc::new(builder.build().unwrap())
+    builder.build().unwrap()
 }
 
 fn get_pipeline(
     device: Arc<Device>,
     render_pass: Arc<RenderPass>,
-    shaders: &Shaders,
+    viewport: Viewport,
+    vertex_shader: EntryPoint,
+    fragment_shader: EntryPoint,
 ) -> Arc<GraphicsPipeline> {
-    GraphicsPipeline::start()
-        .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
-        .input_assembly_state(InputAssemblyState::new())
-        .vertex_input_state(Vertex::per_vertex())
-        .vertex_shader(shaders.vertex_shader.entry_point("main").unwrap(), ())
-        .fragment_shader(shaders.fragment_shader.entry_point("main").unwrap(), ())
-        .render_pass(Subpass::from(render_pass, 0).unwrap())
-        .build(device)
-        .unwrap()
+    let vertex_input_state =
+        Some(Vertex::per_vertex().definition(&vertex_shader.info().input_interface).unwrap());
+
+    let stages = vec![
+        PipelineShaderStageCreateInfo::new(vertex_shader),
+        PipelineShaderStageCreateInfo::new(fragment_shader),
+    ];
+
+    let layout = PipelineLayout::new(
+        device.clone(),
+        // Since we only have one pipeline in this example, and thus one pipeline layout,
+        // we automatically generate the creation info for it from the resources used in the
+        // shaders. In a real application, you would specify this information manually so that you
+        // can re-use one layout in multiple pipelines.
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+
+    let subpass = Subpass::from(render_pass, 0).unwrap();
+
+    GraphicsPipeline::new(
+        device,
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into(),
+            viewport_state: Some(ViewportState { viewports: vec![viewport].into(), ..default() }),
+            rasterization_state: Some(default()),
+            input_assembly_state: Some(default()),
+            multisample_state: Some(default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            vertex_input_state,
+            subpass: Some(subpass.into()),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .unwrap()
 }
 
-fn get_framebuffers(
-    images: &[Arc<SwapchainImage>],
-    render_pass: &Arc<RenderPass>,
-) -> Vec<Arc<Framebuffer>> {
+fn get_framebuffers(images: &[Arc<Image>], render_pass: &Arc<RenderPass>) -> Vec<Arc<Framebuffer>> {
     images
         .iter()
         .map(|image| {
@@ -390,10 +549,10 @@ fn get_render_pass(device: Arc<Device>, swapchain: &Arc<Swapchain>) -> Arc<Rende
         device,
         attachments: {
             color: {
-                load: Clear,
-                store: Store,
                 format: swapchain.image_format(),
                 samples: 1,
+                load_op: Clear,
+                store_op: Store,
             },
         },
         pass: {
@@ -407,41 +566,45 @@ fn get_render_pass(device: Arc<Device>, swapchain: &Arc<Swapchain>) -> Arc<Rende
 #[derive(BufferContents, VertexTrait)]
 #[repr(C)]
 struct Vertex {
-    #[format(R32G32_SFLOAT)]
-    position: [f32; 2],
+    #[format(R32G32B32_SFLOAT)]
+    position: [f32; 3],
     #[format(R32G32B32_SFLOAT)]
     color: [f32; 3],
 }
 
-fn create_window(instance: Arc<Instance>) -> (Arc<Window>, Arc<Surface>, EventLoop<()>, Viewport) {
-    let event_loop = EventLoop::new();
-
+fn create_window(
+    instance: Arc<Instance>,
+    event_loop: &EventLoop<()>,
+) -> (Arc<Window>, Arc<Surface>, Viewport) {
     let window = Arc::new(
-        WindowBuilder::new().build(&event_loop).expect("Should successfully create Window"),
+        WindowBuilder::new().build(event_loop).expect("Should successfully create Window"),
     );
 
-    let surface = create_surface_from_winit(window.clone(), instance)
+    let surface = Surface::from_window(instance.clone(), window.clone())
         .expect("Should successfully create Surface");
 
-    let viewport = Viewport {
-        origin: [0.0, 0.0],
-        dimensions: window.inner_size().into(),
-        depth_range: 0.0..1.0,
-    };
+    let viewport = Viewport { extent: window.inner_size().into(), ..default() };
 
-    (window, surface, event_loop, viewport)
+    (window, surface, viewport)
 }
 
-fn get_instance() -> Arc<Instance> {
+fn get_instance(event_loop: &EventLoop<()>) -> Arc<Instance> {
     let library = VulkanLibrary::new().expect("Should find local Vulkan library/DLL");
 
-    #[cfg(debug_assertions)]
-    let enabled_extensions =
-        InstanceExtensions { ext_debug_utils: true, ..required_extensions(&library) };
+    let enabled_extensions = InstanceExtensions {
+        #[cfg(debug_assertions)]
+        ext_debug_utils: true,
+        ..Surface::required_extensions(event_loop)
+    };
 
-    #[cfg(not(debug_assertions))]
-    let enabled_extensions = required_extensions(&library);
-
-    Instance::new(library, InstanceCreateInfo { enabled_extensions, ..default() })
-        .expect("Failed to create instance")
+    Instance::new(
+        library,
+        InstanceCreateInfo {
+            enabled_extensions,
+            #[cfg(debug_assertions)]
+            debug_utils_messengers: get_debug_messenger_info(),
+            ..default()
+        },
+    )
+    .expect("Failed to create instance")
 }
