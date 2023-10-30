@@ -4,11 +4,9 @@ use std::default::Default;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cgmath::{Angle, Matrix4, Rad};
-#[cfg(debug_assertions)]
-use colored::Colorize;
+use cgmath::{Angle, Matrix4, PerspectiveFov, Rad};
 use default::default;
-use rand::Rng;
+use gltf::mesh::util::{ReadColors, ReadIndices, ReadPositions};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
@@ -34,23 +32,14 @@ use vulkano::device::{
 };
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageUsage};
+use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
 #[cfg(debug_assertions)]
-use vulkano::instance::debug::{
-    DebugUtilsMessageSeverity,
-    DebugUtilsMessageType,
-    DebugUtilsMessengerCallback,
-    DebugUtilsMessengerCallbackData,
-    DebugUtilsMessengerCreateInfo,
-};
+use vulkano::instance::debug::{DebugUtilsMessengerCreateInfo, ValidationFeatureEnable};
 use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
-use vulkano::memory::allocator::{
-    AllocationCreateInfo,
-    MemoryAllocator,
-    MemoryTypeFilter,
-    StandardMemoryAllocator,
-};
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
+use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex as VertexTrait, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
@@ -87,7 +76,7 @@ fn main() {
     let instance = get_instance(&event_loop);
 
     let (physical_device, device, mut queues) = get_device(&instance);
-    let (window, surface, mut viewport) = create_window(instance.clone(), &event_loop);
+    let (window, surface, mut viewport) = create_window(&instance, &event_loop);
 
     //let format = physical_device.surface_formats(&surface, default()).unwrap()[0].0;
     let format = Format::B8G8R8A8_SRGB; // TODO: Pick best format
@@ -102,13 +91,13 @@ fn main() {
     let pipeline = get_pipeline(device.clone(), render_pass.clone(), viewport.clone(), vs, fs);
     let queue = queues.next().expect("There should be exactly one queue");
 
-    let mut framebuffers = get_framebuffers(&images, &render_pass);
-
     let mut bad_swapchain = false;
     let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
     let command_buffer_allocator = StandardCommandBufferAllocator::new(device.clone(), default());
     let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone(), default());
+
+    let mut framebuffers = get_framebuffers(&images, &render_pass, memory_allocator.clone());
 
     let uniform_buffer = SubbufferAllocator::new(
         memory_allocator.clone(),
@@ -119,6 +108,91 @@ fn main() {
             ..default()
         },
     );
+
+    // let mut rng = rand::thread_rng();
+    // let vertices = vec![
+    //     Vertex { position: [-0.5, rng.gen::<f32>() * 2. - 1.], color: [1., 0., 0.] },
+    //     Vertex { position: [0.0, rng.gen::<f32>() * 2. - 1.], color: [0., 1., 0.] },
+    //     Vertex { position: [0.5, rng.gen::<f32>() * 2. - 1.], color: [0., 0., 1.] },
+    // ];
+
+    // let vertices = vec![
+    //     Vertex { position: [-0.5, 0.5, 0.], color: [1., 0., 0.] },
+    //     Vertex { position: [0.0, -0.5, 0.], color: [0., 1., 0.] },
+    //     Vertex { position: [0.5, 0.5, 0.], color: [0., 0., 1.] },
+    //     Vertex { position: [1., -0.5, 0.], color: [0., 0., 1.] },
+    // ];
+
+    let (document, buffers, _images) =
+        gltf::import("resources/models/teapot_smile.gltf").expect("Model should be imported");
+    let primitives = document.meshes().next().unwrap().primitives().next().unwrap();
+
+    let reader = primitives.reader(|b| Some(buffers[b.index()].0.as_slice()));
+
+    // let pos_index = primitives.attributes().find(|a| a.0 == Semantic::Positions).unwrap().1.index();
+    // let indices_accessor = primitives.indices().unwrap();
+    //
+    // let vertices = buffers;
+
+    let colors;
+    let positions;
+    let indices;
+
+    if let ReadColors::RgbaU16(c) = reader.read_colors(0).unwrap() {
+        colors = c.map(|x| x.map(|a| (a / u16::MAX) as f32));
+    } else {
+        unimplemented!();
+    }
+    if let ReadPositions::Standard(p) = reader.read_positions().unwrap() {
+        positions = p;
+    } else {
+        unimplemented!();
+    }
+    if let ReadIndices::U16(i) = reader.read_indices().unwrap() {
+        indices = i;
+    } else {
+        unimplemented!();
+    }
+
+    // println!("colors {}", colors.len());
+    // println!("pos {}", positions.len());
+    // println!("indices {}", indices.len());
+
+    let color_buffer = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo { usage: BufferUsage::VERTEX_BUFFER, ..default() },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..default()
+        },
+        colors,
+    )
+    .unwrap();
+
+    let position_buffer = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo { usage: BufferUsage::VERTEX_BUFFER, ..default() },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..default()
+        },
+        positions,
+    )
+    .unwrap();
+
+    let index_buffer = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo { usage: BufferUsage::INDEX_BUFFER, ..default() },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..default()
+        },
+        indices,
+    )
+    .unwrap();
 
     let rotation_start = Instant::now();
 
@@ -148,7 +222,8 @@ fn main() {
 
                 swapchain = new_swapchain;
 
-                framebuffers = get_framebuffers(&new_images, &render_pass);
+                framebuffers =
+                    get_framebuffers(&new_images, &render_pass, memory_allocator.clone());
             }
 
             #[allow(unused_variables)] // TODO: Remove after RustRover bug is fixed
@@ -174,14 +249,32 @@ fn main() {
                     elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0;
                 let theta = Rad(rotation as f32);
 
-                let (s, c) = Rad::sin_cos(theta.into());
+                let (s, c) = Rad::sin_cos(theta);
+                // #[rustfmt::skip]
+                // let model = Matrix4::new(
+                //     c,  0., -s, 0.,
+                //     0., 1., 0., 0.,
+                //     s,  0., c,  0.,
+                //     0.0, 0.0, 0.0, 1.,
+                // );
+
                 #[rustfmt::skip]
                 let model = Matrix4::new(
-                    c,  0., -s, 0.,
+                    s, 0., c, 0.,
                     0., 1., 0., 0.,
-                    s,  0., c,  0.,
-                    0., 0., -1.5, 1.,
+                    -c, 0., s, 0.,
+                    0., 1.5, -6.5, 1.,
                 );
+
+                #[rustfmt::skip]
+                let fixrot = Matrix4::new(
+                    1., 0., 0., 0.,
+                    0., 0., -1., 0.,
+                    0., 1., 0., 0.,
+                    0., 0., 0., 1.,
+                );
+
+                let model = model * fixrot;
 
                 // note: this teapot was meant for OpenGL where the origin is at the lower left
                 //       instead the origin is at the upper left in Vulkan, so we reverse the Y axis
@@ -200,8 +293,8 @@ fn main() {
 
                 #[rustfmt::skip]
                 let projection: Matrix4<f32> = Matrix4::new(
-                    fa, 0., 0.,  0.,
-                    0., f,  0.,  0.,
+                    -fa, 0., 0.,  0.,
+                    0., f, 0.,  0.,
                     0., 0., f1, -1.,
                     0., 0., f2,  0.,
                 );
@@ -226,15 +319,26 @@ fn main() {
                 subbuffer
             };
 
+            let layout = pipeline.layout().set_layouts().get(0).unwrap();
+
+            let set = PersistentDescriptorSet::new(
+                &descriptor_set_allocator,
+                layout.clone(),
+                [WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer)],
+                [],
+            )
+            .unwrap();
+
             let command_buffer = get_command_buffer(
                 &command_buffer_allocator,
                 &queue,
                 &pipeline,
                 &framebuffers[image_index as usize],
-                memory_allocator.clone(),
                 &viewport,
-                uniform_buffer_subbuffer,
-                &descriptor_set_allocator,
+                set,
+                &position_buffer,
+                &color_buffer,
+                &index_buffer,
             );
 
             let future = previous_frame_end
@@ -267,6 +371,14 @@ fn main() {
 
 #[cfg(debug_assertions)]
 fn get_debug_messenger_info() -> Vec<DebugUtilsMessengerCreateInfo> {
+    use colored::Colorize;
+    use vulkano::instance::debug::{
+        DebugUtilsMessageSeverity,
+        DebugUtilsMessageType,
+        DebugUtilsMessengerCallback,
+        DebugUtilsMessengerCallbackData,
+    };
+
     let user_callback = |sev, ty, data: DebugUtilsMessengerCallbackData| {
         println!(
             "[{severity} {ty}][{prefix:.14}] {desc}",
@@ -384,61 +496,12 @@ fn get_command_buffer(
     queue: &Arc<Queue>,
     pipeline: &Arc<GraphicsPipeline>,
     framebuffer: &Arc<Framebuffer>,
-    memory_allocator: Arc<dyn MemoryAllocator>,
     viewport: &Viewport,
-    uniform_buffer_subbuffer: Subbuffer<vertex_shader::Data>,
-    descriptor_set_allocator: &StandardDescriptorSetAllocator,
+    set: Arc<PersistentDescriptorSet>,
+    position_buffer: &Subbuffer<[[f32; 3]]>,
+    color_buffer: &Subbuffer<[[f32; 4]]>,
+    index_buffer: &Subbuffer<[u16]>,
 ) -> Arc<PrimaryAutoCommandBuffer> {
-    let mut rng = rand::thread_rng();
-
-    // let vertices = vec![
-    //     Vertex { position: [-0.5, rng.gen::<f32>() * 2. - 1.], color: [1., 0., 0.] },
-    //     Vertex { position: [0.0, rng.gen::<f32>() * 2. - 1.], color: [0., 1., 0.] },
-    //     Vertex { position: [0.5, rng.gen::<f32>() * 2. - 1.], color: [0., 0., 1.] },
-    // ];
-
-    let vertices = vec![
-        Vertex { position: [-0.5, 0.5, 0.], color: [1., 0., 0.] },
-        Vertex { position: [0.0, -0.5, 0.], color: [0., 1., 0.] },
-        Vertex { position: [0.5, 0.5, 0.], color: [0., 0., 1.] },
-        Vertex { position: [1., -0.5, 0.], color: [0., 0., 1.] },
-    ];
-
-    let indices: Vec<u16> = vec![0, 1, 2, 1, 2, 3];
-
-    let vertex_buffer = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo { usage: BufferUsage::VERTEX_BUFFER, ..default() },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..default()
-        },
-        vertices,
-    )
-    .unwrap();
-
-    let index_buffer = Buffer::from_iter(
-        memory_allocator,
-        BufferCreateInfo { usage: BufferUsage::INDEX_BUFFER, ..default() },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..default()
-        },
-        indices,
-    )
-    .unwrap();
-
-    let layout = pipeline.layout().set_layouts().get(0).unwrap();
-    let set = PersistentDescriptorSet::new(
-        descriptor_set_allocator,
-        layout.clone(),
-        [WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer)],
-        [],
-    )
-    .unwrap();
-
     let mut builder = AutoCommandBufferBuilder::primary(
         command_buffer_allocator,
         queue.queue_family_index(),
@@ -449,7 +512,7 @@ fn get_command_buffer(
     builder
         .begin_render_pass(
             RenderPassBeginInfo {
-                clear_values: vec![Some([0.01, 0.01, 0.01, 1.0].into())],
+                clear_values: vec![Some([0.01, 0.01, 0.01, 1.0].into()), Some(1f32.into())],
                 ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
             },
             SubpassBeginInfo { contents: SubpassContents::Inline, ..default() },
@@ -461,7 +524,7 @@ fn get_command_buffer(
         .unwrap()
         .bind_descriptor_sets(PipelineBindPoint::Graphics, pipeline.layout().clone(), 0, set)
         .unwrap()
-        .bind_vertex_buffers(0, vertex_buffer.clone())
+        .bind_vertex_buffers(0, (position_buffer.clone(), color_buffer.clone()))
         .unwrap()
         .bind_index_buffer(index_buffer.clone())
         .unwrap()
@@ -486,8 +549,11 @@ fn get_pipeline(
     vertex_shader: EntryPoint,
     fragment_shader: EntryPoint,
 ) -> Arc<GraphicsPipeline> {
-    let vertex_input_state =
-        Some(Vertex::per_vertex().definition(&vertex_shader.info().input_interface).unwrap());
+    let vertex_input_state = Some(
+        [VertexPositions::per_vertex(), VertexColor::per_vertex()]
+            .definition(&vertex_shader.info().input_interface)
+            .unwrap(),
+    );
 
     let stages = vec![
         PipelineShaderStageCreateInfo::new(vertex_shader),
@@ -514,13 +580,20 @@ fn get_pipeline(
         GraphicsPipelineCreateInfo {
             stages: stages.into(),
             viewport_state: Some(ViewportState { viewports: vec![viewport].into(), ..default() }),
-            rasterization_state: Some(default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..default()
+            }),
             input_assembly_state: Some(default()),
             multisample_state: Some(default()),
             color_blend_state: Some(ColorBlendState::with_attachment_states(
                 subpass.num_color_attachments(),
                 ColorBlendAttachmentState::default(),
             )),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState::simple()),
+                ..default()
+            }),
             vertex_input_state,
             subpass: Some(subpass.into()),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
@@ -530,14 +603,37 @@ fn get_pipeline(
     .unwrap()
 }
 
-fn get_framebuffers(images: &[Arc<Image>], render_pass: &Arc<RenderPass>) -> Vec<Arc<Framebuffer>> {
+fn get_framebuffers(
+    images: &[Arc<Image>],
+    render_pass: &Arc<RenderPass>,
+    memory_allocator: Arc<StandardMemoryAllocator>,
+) -> Vec<Arc<Framebuffer>> {
+    let depth_buffer = ImageView::new_default(
+        Image::new(
+            memory_allocator,
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::D16_UNORM,
+                extent: images[0].extent(),
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
     images
         .iter()
         .map(|image| {
             let view = ImageView::new_default(image.clone()).unwrap();
             Framebuffer::new(
                 render_pass.clone(),
-                FramebufferCreateInfo { attachments: vec![view], ..default() },
+                FramebufferCreateInfo {
+                    attachments: vec![view, depth_buffer.clone()],
+                    ..default()
+                },
             )
             .unwrap()
         })
@@ -554,10 +650,16 @@ fn get_render_pass(device: Arc<Device>, swapchain: &Arc<Swapchain>) -> Arc<Rende
                 load_op: Clear,
                 store_op: Store,
             },
+            depth_stencil: {
+                format: Format::D16_UNORM,
+                samples: 1,
+                load_op: Clear,
+                store_op: DontCare,
+            },
         },
         pass: {
             color: [color],
-            depth_stencil: {},
+            depth_stencil: {depth_stencil},
         },
     )
     .unwrap()
@@ -565,15 +667,20 @@ fn get_render_pass(device: Arc<Device>, swapchain: &Arc<Swapchain>) -> Arc<Rende
 
 #[derive(BufferContents, VertexTrait)]
 #[repr(C)]
-struct Vertex {
+struct VertexPositions {
     #[format(R32G32B32_SFLOAT)]
     position: [f32; 3],
-    #[format(R32G32B32_SFLOAT)]
-    color: [f32; 3],
+}
+
+#[derive(BufferContents, VertexTrait)]
+#[repr(C)]
+struct VertexColor {
+    #[format(R32G32B32A32_SFLOAT)]
+    color: [f32; 4],
 }
 
 fn create_window(
-    instance: Arc<Instance>,
+    instance: &Arc<Instance>,
     event_loop: &EventLoop<()>,
 ) -> (Arc<Window>, Arc<Surface>, Viewport) {
     let window = Arc::new(
@@ -594,6 +701,8 @@ fn get_instance(event_loop: &EventLoop<()>) -> Arc<Instance> {
     let enabled_extensions = InstanceExtensions {
         #[cfg(debug_assertions)]
         ext_debug_utils: true,
+        #[cfg(debug_assertions)]
+        ext_validation_features: true,
         ..Surface::required_extensions(event_loop)
     };
 
@@ -602,7 +711,14 @@ fn get_instance(event_loop: &EventLoop<()>) -> Arc<Instance> {
         InstanceCreateInfo {
             enabled_extensions,
             #[cfg(debug_assertions)]
+            enabled_layers: vec!["VK_LAYER_KHRONOS_validation".to_string()],
+            #[cfg(debug_assertions)]
             debug_utils_messengers: get_debug_messenger_info(),
+            #[cfg(debug_assertions)]
+            enabled_validation_features: vec![
+                ValidationFeatureEnable::DebugPrintf,
+                ValidationFeatureEnable::BestPractices,
+            ],
             ..default()
         },
     )
