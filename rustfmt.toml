@@ -1,4 +1,3 @@
 imports_granularity = "Module"
 group_imports = "StdExternalCrate"
-imports_layout = "HorizontalVertical"
 use_small_heuristics = "Max"

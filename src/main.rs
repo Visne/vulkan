@@ -4,31 +4,21 @@ use std::default::Default;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cgmath::{Angle, Matrix4, PerspectiveFov, Rad};
+use cgmath::{Angle, Matrix4, Rad};
 use default::default;
 use gltf::mesh::util::{ReadColors, ReadIndices, ReadPositions};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder,
-    CommandBufferUsage,
-    PrimaryAutoCommandBuffer,
-    RenderPassBeginInfo,
-    SubpassBeginInfo,
-    SubpassContents,
-    SubpassEndInfo,
+    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo,
+    SubpassBeginInfo, SubpassContents, SubpassEndInfo,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
-    Device,
-    DeviceCreateInfo,
-    DeviceExtensions,
-    Queue,
-    QueueCreateInfo,
-    QueueFlags,
+    Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
 };
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
@@ -39,28 +29,19 @@ use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
-use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
+use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex as VertexTrait, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
-    DynamicState,
-    GraphicsPipeline,
-    Pipeline,
-    PipelineBindPoint,
-    PipelineLayout,
+    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
 use vulkano::shader::EntryPoint;
 use vulkano::swapchain::{
-    acquire_next_image,
-    PresentMode,
-    Surface,
-    Swapchain,
-    SwapchainCreateInfo,
-    SwapchainPresentInfo,
+    acquire_next_image, PresentMode, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
 };
 use vulkano::sync::GpuFuture;
 use vulkano::{single_pass_renderpass, sync, Validated, VulkanError, VulkanLibrary};
@@ -72,7 +53,7 @@ use crate::shaders::{fragment_shader, vertex_shader};
 
 #[allow(clippy::too_many_lines)]
 fn main() {
-    let event_loop = EventLoop::new();
+    let event_loop = EventLoop::new().expect("Should create event loop");
     let instance = get_instance(&event_loop);
 
     let (physical_device, device, mut queues) = get_device(&instance);
@@ -154,10 +135,6 @@ fn main() {
         unimplemented!();
     }
 
-    // println!("colors {}", colors.len());
-    // println!("pos {}", positions.len());
-    // println!("indices {}", indices.len());
-
     let color_buffer = Buffer::from_iter(
         memory_allocator.clone(),
         BufferCreateInfo { usage: BufferUsage::VERTEX_BUFFER, ..default() },
@@ -196,186 +173,190 @@ fn main() {
 
     let rotation_start = Instant::now();
 
-    event_loop.run(move |event, _, control_flow| match event {
-        Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
-            *control_flow = ControlFlow::Exit;
-        }
+    event_loop.set_control_flow(ControlFlow::Poll);
 
-        Event::WindowEvent { event: WindowEvent::Resized(_), .. } => {
-            bad_swapchain = true;
-            viewport.extent = window.inner_size().into();
-        }
+    event_loop
+        .run(move |event, target| match event {
+            Event::WindowEvent { event, .. } => match event {
+                WindowEvent::CloseRequested => target.exit(),
 
-        Event::MainEventsCleared => {
-            previous_frame_end.as_mut().unwrap().cleanup_finished();
-
-            if bad_swapchain {
-                bad_swapchain = false;
-
-                let dimensions = window.inner_size().into();
-                let (new_swapchain, new_images) = swapchain
-                    .recreate(SwapchainCreateInfo {
-                        image_extent: dimensions,
-                        ..swapchain.create_info()
-                    })
-                    .expect("Failed to recreate swapchain: {e}");
-
-                swapchain = new_swapchain;
-
-                framebuffers =
-                    get_framebuffers(&new_images, &render_pass, memory_allocator.clone());
-            }
-
-            #[allow(unused_variables)] // TODO: Remove after RustRover bug is fixed
-            let (image_index, suboptimal, acquire_future) =
-                match acquire_next_image(swapchain.clone(), None).map_err(Validated::unwrap) {
-                    Ok(r) => r,
-                    Err(VulkanError::OutOfDate) => {
-                        // Recreate swapchain right away
-                        bad_swapchain = true;
-                        return;
-                    }
-                    Err(e) => panic!("Failed to acquire next image: {e}"),
-                };
-
-            if suboptimal {
-                // Recreate swapchain next frame
-                bad_swapchain = true;
-            }
-
-            let uniform_buffer_subbuffer = {
-                let elapsed = rotation_start.elapsed();
-                let rotation =
-                    elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0;
-                let theta = Rad(rotation as f32);
-
-                let (s, c) = Rad::sin_cos(theta);
-                // #[rustfmt::skip]
-                // let model = Matrix4::new(
-                //     c,  0., -s, 0.,
-                //     0., 1., 0., 0.,
-                //     s,  0., c,  0.,
-                //     0.0, 0.0, 0.0, 1.,
-                // );
-
-                #[rustfmt::skip]
-                let model = Matrix4::new(
-                    s, 0., c, 0.,
-                    0., 1., 0., 0.,
-                    -c, 0., s, 0.,
-                    0., 1.5, -6.5, 1.,
-                );
-
-                #[rustfmt::skip]
-                let fixrot = Matrix4::new(
-                    1., 0., 0., 0.,
-                    0., 0., -1., 0.,
-                    0., 1., 0., 0.,
-                    0., 0., 0., 1.,
-                );
-
-                let model = model * fixrot;
-
-                // note: this teapot was meant for OpenGL where the origin is at the lower left
-                //       instead the origin is at the upper left in Vulkan, so we reverse the Y axis
-
-                let aspect_ratio =
-                    swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
-
-                let vertical_fov = Rad(std::f32::consts::FRAC_PI_2);
-                let near = 0.01;
-                let far = 100.0;
-
-                let f = Rad::cot(vertical_fov / 2.);
-                let fa = f / aspect_ratio;
-                let f1 = (far + near) / (near - far);
-                let f2 = (2. * far * near) / (near - far);
-
-                #[rustfmt::skip]
-                let projection: Matrix4<f32> = Matrix4::new(
-                    -fa, 0., 0.,  0.,
-                    0., f, 0.,  0.,
-                    0., 0., f1, -1.,
-                    0., 0., f2,  0.,
-                );
-
-                // let view = Matrix4::look_at_rh(
-                //     Point3::new(0.3, 0.3, 1.0),
-                //     Point3::new(0.0, 0.0, 0.0),
-                //     Vector3::new(0.0, -1.0, 0.0),
-                // );
-                // let scale = Matrix4::from_scale(0.01);
-
-                let uniform_data = vertex_shader::Data {
-                    //world: Matrix4::from(rotation).into(),
-                    //view: (view * scale).into(),
-                    model: model.into(),
-                    projection: projection.into(),
-                };
-
-                let subbuffer = uniform_buffer.allocate_sized().unwrap();
-                *subbuffer.write().unwrap() = uniform_data;
-
-                subbuffer
-            };
-
-            let layout = pipeline.layout().set_layouts().get(0).unwrap();
-
-            let set = PersistentDescriptorSet::new(
-                &descriptor_set_allocator,
-                layout.clone(),
-                [WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer)],
-                [],
-            )
-            .unwrap();
-
-            let command_buffer = get_command_buffer(
-                &command_buffer_allocator,
-                &queue,
-                &pipeline,
-                &framebuffers[image_index as usize],
-                &viewport,
-                set,
-                &position_buffer,
-                &color_buffer,
-                &index_buffer,
-            );
-
-            let future = previous_frame_end
-                .take()
-                .unwrap()
-                .join(acquire_future)
-                .then_execute(queue.clone(), command_buffer.clone())
-                .unwrap()
-                .then_swapchain_present(
-                    queue.clone(),
-                    SwapchainPresentInfo::swapchain_image_index(swapchain.clone(), image_index),
-                )
-                .then_signal_fence_and_flush();
-
-            match future.map_err(Validated::unwrap) {
-                Ok(future) => previous_frame_end = Some(future.boxed()),
-                Err(VulkanError::OutOfDate) => {
+                WindowEvent::Resized(_) => {
                     bad_swapchain = true;
-                    previous_frame_end = Some(sync::now(device.clone()).boxed());
+                    viewport.extent = window.inner_size().into();
                 }
-                Err(e) => {
-                    println!("Failed to flush future: {e}");
-                }
-            };
-        }
 
-        _ => {}
-    });
+                _ => {}
+            },
+
+            Event::AboutToWait => {
+                previous_frame_end.as_mut().unwrap().cleanup_finished();
+
+                if bad_swapchain {
+                    bad_swapchain = false;
+
+                    let dimensions = window.inner_size().into();
+                    let (new_swapchain, new_images) = swapchain
+                        .recreate(SwapchainCreateInfo {
+                            image_extent: dimensions,
+                            ..swapchain.create_info()
+                        })
+                        .expect("Failed to recreate swapchain: {e}");
+
+                    swapchain = new_swapchain;
+
+                    framebuffers =
+                        get_framebuffers(&new_images, &render_pass, memory_allocator.clone());
+                }
+
+                #[allow(unused_variables)] // TODO: Remove after RustRover bug is fixed
+                let (image_index, suboptimal, acquire_future) =
+                    match acquire_next_image(swapchain.clone(), None).map_err(Validated::unwrap) {
+                        Ok(r) => r,
+                        Err(VulkanError::OutOfDate) => {
+                            // Recreate swapchain right away
+                            bad_swapchain = true;
+                            return;
+                        }
+                        Err(e) => panic!("Failed to acquire next image: {e}"),
+                    };
+
+                if suboptimal {
+                    // Recreate swapchain next frame
+                    bad_swapchain = true;
+                }
+
+                let uniform_buffer_subbuffer = {
+                    let elapsed = rotation_start.elapsed();
+                    let rotation =
+                        elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0;
+                    let theta = Rad(rotation as f32);
+
+                    let (s, c) = Rad::sin_cos(theta);
+                    // #[rustfmt::skip]
+                    // let model = Matrix4::new(
+                    //     c,  0., -s, 0.,
+                    //     0., 1., 0., 0.,
+                    //     s,  0., c,  0.,
+                    //     0.0, 0.0, 0.0, 1.,
+                    // );
+
+                    #[rustfmt::skip]
+                    let model = Matrix4::new(
+                        s, 0., c, 0.,
+                        0., 1., 0., 0.,
+                        -c, 0., s, 0.,
+                        0., 1.5, -6.5, 1.,
+                    );
+
+                    #[rustfmt::skip]
+                    let fixrot = Matrix4::new(
+                        1., 0., 0., 0.,
+                        0., 0., -1., 0.,
+                        0., 1., 0., 0.,
+                        0., 0., 0., 1.,
+                    );
+
+                    let model = model * fixrot;
+
+                    // note: this teapot was meant for OpenGL where the origin is at the lower left
+                    //       instead the origin is at the upper left in Vulkan, so we reverse the Y axis
+
+                    let aspect_ratio =
+                        swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
+
+                    let vertical_fov = Rad(std::f32::consts::FRAC_PI_2);
+                    let near = 0.01;
+                    let far = 100.0;
+
+                    let f = Rad::cot(vertical_fov / 2.);
+                    let fa = f / aspect_ratio;
+                    let f1 = (far + near) / (near - far);
+                    let f2 = (2. * far * near) / (near - far);
+
+                    #[rustfmt::skip]
+                    let projection: Matrix4<f32> = Matrix4::new(
+                        -fa, 0., 0., 0.,
+                        0., f, 0., 0.,
+                        0., 0., f1, -1.,
+                        0., 0., f2, 0.,
+                    );
+
+                    // let view = Matrix4::look_at_rh(
+                    //     Point3::new(0.3, 0.3, 1.0),
+                    //     Point3::new(0.0, 0.0, 0.0),
+                    //     Vector3::new(0.0, -1.0, 0.0),
+                    // );
+                    // let scale = Matrix4::from_scale(0.01);
+
+                    let uniform_data = vertex_shader::Data {
+                        //world: Matrix4::from(rotation).into(),
+                        //view: (view * scale).into(),
+                        model: model.into(),
+                        projection: projection.into(),
+                    };
+
+                    let subbuffer = uniform_buffer.allocate_sized().unwrap();
+                    *subbuffer.write().unwrap() = uniform_data;
+
+                    subbuffer
+                };
+
+                let layout = pipeline.layout().set_layouts().get(0).unwrap();
+
+                let set = PersistentDescriptorSet::new(
+                    &descriptor_set_allocator,
+                    layout.clone(),
+                    [WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer)],
+                    [],
+                )
+                .unwrap();
+
+                let command_buffer = get_command_buffer(
+                    &command_buffer_allocator,
+                    &queue,
+                    &pipeline,
+                    &framebuffers[image_index as usize],
+                    &viewport,
+                    set,
+                    &position_buffer,
+                    &color_buffer,
+                    &index_buffer,
+                );
+
+                let future = previous_frame_end
+                    .take()
+                    .unwrap()
+                    .join(acquire_future)
+                    .then_execute(queue.clone(), command_buffer.clone())
+                    .unwrap()
+                    .then_swapchain_present(
+                        queue.clone(),
+                        SwapchainPresentInfo::swapchain_image_index(swapchain.clone(), image_index),
+                    )
+                    .then_signal_fence_and_flush();
+
+                match future.map_err(Validated::unwrap) {
+                    Ok(future) => previous_frame_end = Some(future.boxed()),
+                    Err(VulkanError::OutOfDate) => {
+                        bad_swapchain = true;
+                        previous_frame_end = Some(sync::now(device.clone()).boxed());
+                    }
+                    Err(e) => {
+                        println!("Failed to flush future: {e}");
+                    }
+                };
+            }
+
+            _ => {}
+        })
+        .expect("Event loop should not error");
 }
 
 #[cfg(debug_assertions)]
 fn get_debug_messenger_info() -> Vec<DebugUtilsMessengerCreateInfo> {
     use colored::Colorize;
     use vulkano::instance::debug::{
-        DebugUtilsMessageSeverity,
-        DebugUtilsMessageType,
-        DebugUtilsMessengerCallback,
+        DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessengerCallback,
         DebugUtilsMessengerCallbackData,
     };
 
